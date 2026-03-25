@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 # Paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "inventory.db")
-EXCEL_PATH = os.path.join(BASE_DIR, "data", "Current Inventory.xlsx")  # ✅ FIXED
+EXCEL_PATH = os.path.join(BASE_DIR,"Current Inventory.xlsx")  # ✅ FIXED
 
 # Streamlit page config
 st.set_page_config(
