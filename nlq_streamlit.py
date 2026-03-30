@@ -262,6 +262,43 @@ When the user asks about a specific material code or name:
    does not exist in the database and suggest checking the spelling.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SHELF STOCK QUANTITY vs VALUE RULE  (CRITICAL)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"Shelf Stock" stores RAW QUANTITY (FT, ST, LB, EA, etc.).
+Each row has a different UOM, so SUM("Shelf Stock") across
+multiple materials is MEANINGLESS — you'd be adding feet to
+pieces to pounds.
+
+"Shelf Stock ($)" stores the DOLLAR VALUE and IS safe to SUM
+across materials because it's always in the same unit ($).
+
+RULES:
+1. For ANY aggregation across multiple materials or plants,
+   ALWAYS use SUM("Shelf Stock ($)") — never SUM("Shelf Stock").
+
+2. Only use "Shelf Stock" (quantity) when:
+   - Filtering a single material with a known UOM
+   - The user explicitly asks for quantity/units (not value)
+   - You are also showing the UOM column alongside it
+
+3. When user asks "shelf stock available", "total shelf stock",
+   "how much shelf stock" → default to "Shelf Stock ($)" and
+   label the result clearly as dollar value.
+
+4. When a user asks for both quantity AND value, return both
+   columns separately — never combine them.
+
+CORRECT example for "total sensor shelf stock":
+  SELECT SUM("Shelf Stock ($)") AS total_shelf_stock_value
+  FROM inventory
+  WHERE "MRP Controller Text" LIKE '%SENSOR%'
+
+WRONG example (never do this):
+  SELECT SUM("Shelf Stock") AS total_shelf_stock   ← mixes units!
+  FROM inventory
+  WHERE "MRP Controller Text" LIKE '%SENSOR%'
+  
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 GENERAL SQL RULES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 1. ALWAYS wrap column names in double-quotes.
