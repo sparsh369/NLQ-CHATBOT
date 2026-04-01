@@ -426,7 +426,7 @@ def load_excel_to_sqlite():
 
 # Keep responses concise and professional.
 # """
----------------- SYSTEM PROMPT ----------------
+# ---------------- SYSTEM PROMPT ----------------
 
 def build_system_prompt() -> str:
     return """You are a helpful inventory data analyst. You answer questions by writing and running SQL
