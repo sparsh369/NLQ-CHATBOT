@@ -45,6 +45,28 @@ if "prefill_query" not in st.session_state:
 
 # ---------------- LOAD DATA ----------------
 
+# def load_excel_to_sqlite():
+#     """Load Excel into SQLite if DB doesn't exist."""
+#     if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > 0:
+#         logger.info("SQLite DB already exists, skipping load.")
+#         return
+
+#     if not os.path.exists(EXCEL_PATH):
+#         st.error(f"❌ Excel file not found at: {EXCEL_PATH}")
+#         st.stop()
+
+#     logger.info(f"Loading Excel from {EXCEL_PATH}")
+#     df = pd.read_excel(EXCEL_PATH, engine="openpyxl")
+
+#     # Strip trailing spaces from column names (e.g. 'Product Family ' -> 'Product Family')
+#     df.columns = [col.strip() for col in df.columns]
+
+#     engine = create_engine(f"sqlite:///{DB_PATH}")
+#     df.to_sql("inventory", engine, if_exists="replace", index=False)
+#     engine.dispose()
+#     logger.info(f"Data written to {DB_PATH} — {len(df):,} rows, {len(df.columns)} columns")
+
+
 def load_excel_to_sqlite():
     """Load Excel into SQLite if DB doesn't exist."""
     if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > 0:
@@ -58,14 +80,43 @@ def load_excel_to_sqlite():
     logger.info(f"Loading Excel from {EXCEL_PATH}")
     df = pd.read_excel(EXCEL_PATH, engine="openpyxl")
 
-    # Strip trailing spaces from column names (e.g. 'Product Family ' -> 'Product Family')
+    # Strip trailing spaces from column names
     df.columns = [col.strip() for col in df.columns]
+
+    # ===== DATA CLEANING =====
+    
+    # 1. Replace empty strings with NULL for critical columns
+    critical_cols = [
+        "Material Name", "SOP Family", "Product Family", 
+        "Material Type", "Product Group", "Material Application",
+        "Sub Application"
+    ]
+    for col in critical_cols:
+        if col in df.columns:
+            df[col] = df[col].replace('', None)
+            df[col] = df[col].replace(' ', None)
+    
+    # 2. Fill numeric NULLs with 0 for calculation columns
+    numeric_cols = [
+        "Shelf Stock", "Shelf Stock ($)", "GIT", "GIT ($)", 
+        "WIP", "WIP($)", "DOH", "Safety Stock", "Demand"
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna(0)
+    
+    # 3. Remove rows with NULL Material Name (these are junk rows)
+    df = df[df["Material Name"].notna()]
+    
+    # 4. Log cleaning statistics
+    logger.info(f"Data cleaned: {len(df):,} valid rows retained")
+    
+    # ===== END CLEANING =====
 
     engine = create_engine(f"sqlite:///{DB_PATH}")
     df.to_sql("inventory", engine, if_exists="replace", index=False)
     engine.dispose()
     logger.info(f"Data written to {DB_PATH} — {len(df):,} rows, {len(df.columns)} columns")
-
 
 # ---------------- SYSTEM PROMPT ----------------
 
