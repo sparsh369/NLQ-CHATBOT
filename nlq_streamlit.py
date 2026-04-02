@@ -4,6 +4,7 @@ import sys
 import streamlit as st
 import pandas as pd
 from sqlalchemy import create_engine, text
+import re
 
 from langchain_community.utilities import SQLDatabase
 from langchain_community.agent_toolkits import SQLDatabaseToolkit
@@ -13,7 +14,6 @@ import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 from langgraph.prebuilt import create_react_agent
-
 
 # ---------------- CONFIG ----------------
 
@@ -43,243 +43,82 @@ if "prefill_query" not in st.session_state:
     st.session_state.prefill_query = None
 
 
+# ---------------- SQL VALIDATION ----------------
+
+def validate_sql(query: str):
+    q = query.upper()
+
+    if 'SUM("SHELF STOCK")' in q:
+        raise ValueError('❌ Invalid: Cannot SUM "Shelf Stock" (mixed UOM). Use "Shelf Stock ($)"')
+
+    if 'SOP FAMILY' in q and 'LIKE' in q:
+        raise ValueError('❌ Invalid: Use "=" instead of LIKE for SOP Family')
+
+    if '"SOP FAMILY"' in q and 'IS NOT NULL' not in q:
+        raise ValueError('❌ Missing: "SOP Family" IS NOT NULL')
+
+    return True
+
+
 # ---------------- LOAD DATA ----------------
 
 def load_excel_to_sqlite():
-    """Load Excel into SQLite with proper data cleaning."""
     if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > 0:
-        logger.info("SQLite DB already exists, skipping load.")
         return
 
-    if not os.path.exists(EXCEL_PATH):
-        st.error(f"❌ Excel file not found at: {EXCEL_PATH}")
-        st.stop()
-
-    logger.info(f"Loading Excel from {EXCEL_PATH}")
     df = pd.read_excel(EXCEL_PATH, engine="openpyxl")
 
-    # Strip trailing spaces from column names (CRITICAL FIX)
     df.columns = [col.strip() for col in df.columns]
-    logger.info(f"Column names after strip: {list(df.columns)}")
 
-    # ===== DATA CLEANING =====
-    
-    # 1. Replace empty strings with NULL for critical text columns
     critical_cols = [
-        "Material Name", "SOP Family", "Product Family", 
+        "Material Name", "SOP Family", "Product Family",
         "Material Type", "Product Group", "Material Application",
         "Sub Application"
     ]
+
     for col in critical_cols:
         if col in df.columns:
             df[col] = df[col].replace('', None)
             df[col] = df[col].replace(' ', None)
-    
-    # 2. Fill numeric NULLs with 0 for calculation columns
+
     numeric_cols = [
-        "Shelf Stock", "Shelf Stock ($)", "GIT", "GIT ($)", 
+        "Shelf Stock", "Shelf Stock ($)", "GIT", "GIT ($)",
         "WIP", "WIP($)", "DOH", "Safety Stock", "Demand"
     ]
+
+    # ✅ FIX: Force numeric conversion
     for col in numeric_cols:
         if col in df.columns:
-            df[col] = df[col].fillna(0)
-    
-    # 3. Remove rows with NULL Material Name (these are junk rows)
-    before_count = len(df)
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
     df = df[df["Material Name"].notna()]
-    after_count = len(df)
-    logger.info(f"Removed {before_count - after_count} rows with NULL Material Name")
-    
-    # 4. Log cleaning statistics
-    logger.info(f"Data cleaned: {len(df):,} valid rows retained")
-    logger.info(f"Rows with SOP Family: {df['SOP Family'].notna().sum():,} ({(df['SOP Family'].notna().sum() / len(df)) * 100:.1f}%)")
-    logger.info(f"Rows with Shelf Stock > 0: {(df['Shelf Stock'] > 0).sum():,}")
-    logger.info(f"Rows with Shelf Stock ($) > 0: {(df['Shelf Stock ($)'] > 0).sum():,}")
-    
-    # ===== END CLEANING =====
 
     engine = create_engine(f"sqlite:///{DB_PATH}")
     df.to_sql("inventory", engine, if_exists="replace", index=False)
-    
-    # Create indexes for better query performance
+
     with engine.connect() as conn:
         conn.execute(text('CREATE INDEX IF NOT EXISTS idx_material_name ON inventory("Material Name")'))
         conn.execute(text('CREATE INDEX IF NOT EXISTS idx_sop_family ON inventory("SOP Family")'))
-        conn.execute(text('CREATE INDEX IF NOT EXISTS idx_plant ON inventory("Plant")'))
-        conn.execute(text('CREATE INDEX IF NOT EXISTS idx_shelf_stock ON inventory("Shelf Stock ($)")'))
         conn.commit()
-    
+
     engine.dispose()
-    logger.info(f"Data written to {DB_PATH} — {len(df):,} rows, {len(df.columns)} columns")
 
 
 # ---------------- SYSTEM PROMPT ----------------
 
 def build_system_prompt() -> str:
-    return """You are a helpful inventory data analyst. You answer questions by writing and running SQL
-against a SQLite database. Think carefully before writing SQL — follow every rule below.
+    return """
+🚨 STRICT VALIDATION RULES (DO NOT BREAK):
 
-════════════════════════════════════════════════════════
-DATABASE:  SQLite   TABLE: inventory   ROWS: ~126,000
-════════════════════════════════════════════════════════
+1. NEVER use SUM("Shelf Stock")
+2. ALWAYS use SUM("Shelf Stock ($)") for totals
+3. ALWAYS use "=" for SOP Family (NO LIKE)
+4. ALWAYS include "SOP Family" IS NOT NULL
+5. ALWAYS use COUNT(DISTINCT "Material Name")
 
-⚠️  CRITICAL RULES - READ THESE FIRST ⚠️
-1. ALWAYS use "Material Name" column (descriptive names), NEVER "Material" (codes)
-   - Exception: Only show "Material" if user explicitly asks for "material codes" or "material IDs"
+If any rule is violated → rewrite query
 
-2. When asked "top materials" WITHOUT explicit sorting criteria:
-   → ALWAYS sort by "Shelf Stock ($)" DESC (highest shelf stock value first)
-   - Only sort by "Demand" if user explicitly says "by demand" or "highest demand"
-
-3. For aggregations across multiple materials/plants:
-   → ALWAYS use "Shelf Stock ($)" for dollar values
-   → NEVER sum "Shelf Stock" (raw quantities) across different UOMs
-
-4. ALWAYS add NULL filters for these columns when using them:
-   - "Material Name" IS NOT NULL (on EVERY query showing materials)
-   - "SOP Family" IS NOT NULL (when filtering/grouping by SOP Family)
-   - "Product Family" IS NOT NULL (when filtering/grouping by Product Family)
-   - "Product Group" IS NOT NULL (when filtering/grouping by Product Group)
-
-5. When filtering by product type (SENSORS, FIBER, NUHEAT, etc.):
-   → Use "SOP Family" column with exact match (=)
-   → NEVER use "MRP Controller Text" (contains planner names, not product types)
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-COLUMN REFERENCE  (wrap EVERY column name in double-quotes in SQL)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Column Name            | Type    | What it means
------------------------|---------|-----------------------------
-"Plant"                | TEXT    | Plant/site ID e.g. 2001, 2024
-"Material"             | TEXT    | Material code e.g. 363097-000 (DO NOT USE - use "Material Name")
-"Material Name"        | TEXT    | Full name of the material (ALWAYS USE THIS)
-"Material Type"        | TEXT    | Category of material
-"UOM"                  | TEXT    | Unit of measure e.g. FT, EA, KG
-"Shelf Stock"          | REAL    | Quantity on shelf (in UOM units) - DO NOT SUM across materials
-"Shelf Stock ($)"      | REAL    | Dollar value of shelf stock - SAFE TO SUM
-"GIT"                  | REAL    | Goods in transit quantity
-"GIT ($)"              | REAL    | Dollar value of GIT
-"WIP"                  | REAL    | Work in progress quantity
-"WIP($)"               | REAL    | Dollar value of WIP
-"DOH"                  | REAL    | Days on hand
-"Safety Stock"         | REAL    | Minimum stock to keep
-"Demand"               | REAL    | Total demand quantity
-"Product Family"       | TEXT    | Product family code e.g. ETL, HWAT
-"SOP Family"           | TEXT    | SOP planning family — PRIMARY product classification
-"Product Group"        | TEXT    | Detailed product group name
-"Material Group"       | TEXT    | Material group e.g. Custom Cable
-"Product Category"     | TEXT    | Category e.g. PD / Project
-"Material Application" | TEXT    | Application e.g. KA / Floor Heating
-"Sub Application"      | TEXT    | Sub-application e.g. KSA / Leak Detection
-"ABC"                  | TEXT    | ABC classification: A, B, or C
-"MRP Controller Text"  | TEXT    | MRP controller/planner name — NOT a product category
-"Purchasing Group Text"| TEXT    | Purchasing group name
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-KNOWN COLUMN VALUES (use exact match = for known values)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-"Material Type" — 11 exact values:
-  Raw materials | Semifinished products | Finished products | Trading goods
-  Packaging | Operating supplies-NON VA | Nonvaluated materials
-  Prod. resources/tools | Optng suppl/Non Cos-VALUA | Spare parts | Services
-
-"ABC":  A | B | C
-
-"SOP Family" — 21 exact values (use = not LIKE):
-  SENSORS | MONO | NUHEAT | RWC-BO | FIBER | FIBER-COAT | FIBER-ZONE
-  SEN-BULK | SEN-KITT | SENSORS ROPED CABLES | SENSORS SUB ASSY
-  SENSORS SUB EPOXY | Reynosa Sensors | Reynosa FrostGuards | Reynosa Panel Shop
-  MONO-CEL_D | CMPT | PKG | nVent Thermal Europe | (and 2 others)
-
-  ⚠️  'SENSORS' means ONLY 'SENSORS' - does NOT include SEN-BULK, SEN-KITT, etc.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CRITICAL QUERY PATTERNS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-1. TOP MATERIALS (without explicit sort criteria):
-   ✅ CORRECT - Sort by Shelf Stock ($):
-   SELECT "Material Name",
-          ROUND(SUM("Shelf Stock ($)"), 2) AS "Shelf Stock Value ($)",
-          ROUND(SUM("Demand"), 2) AS "Total Demand"
-   FROM inventory
-   WHERE "Material Name" IS NOT NULL
-   GROUP BY "Material Name"
-   ORDER BY SUM("Shelf Stock ($)") DESC
-   LIMIT 10;
-
-2. SENSOR SHELF STOCK BY PLANT:
-   ✅ CORRECT:
-   SELECT "Plant",
-          COUNT("Material") AS item_count,
-          ROUND(SUM("Shelf Stock"), 2) AS total_shelf_stock_units,
-          ROUND(SUM("Shelf Stock ($)"), 2) AS total_shelf_stock_value
-   FROM inventory
-   WHERE "SOP Family" = 'SENSORS'
-     AND "Shelf Stock" > 0
-     AND "SOP Family" IS NOT NULL
-   GROUP BY "Plant"
-   ORDER BY total_shelf_stock_units DESC;
-
-3. MATERIALS BY SOP FAMILY:
-   ✅ CORRECT - Always add IS NOT NULL:
-   SELECT "SOP Family",
-          COUNT(DISTINCT "Material Name") AS material_count,
-          ROUND(SUM("Shelf Stock ($)"), 2) AS total_value
-   FROM inventory
-   WHERE "SOP Family" IS NOT NULL
-     AND "Material Name" IS NOT NULL
-   GROUP BY "SOP Family"
-   ORDER BY total_value DESC
-   LIMIT 10;
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-NULL HANDLING - MANDATORY FILTERS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-⚠️  90% of rows have NULL SOP Family - this is NORMAL for this dataset.
-⚠️  Always add IS NOT NULL when filtering/grouping these columns:
-
-- "Material Name" IS NOT NULL → Add to ALL material queries
-- "SOP Family" IS NOT NULL → Add when using SOP Family
-- "Product Family" IS NOT NULL → Add when using Product Family
-- "Product Group" IS NOT NULL → Add when using Product Group
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SHELF STOCK - QUANTITY vs VALUE (CRITICAL)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"Shelf Stock" = RAW QUANTITY (FT, EA, LB, etc.) - different UOMs per row
-"Shelf Stock ($)" = DOLLAR VALUE - safe to SUM across all materials
-
-RULES:
-1. For aggregations across multiple materials → ALWAYS use "Shelf Stock ($)"
-2. Only use "Shelf Stock" when:
-   - Filtering a single material with known UOM
-   - User explicitly asks for "quantity" or "units"
-   - You show "UOM" column alongside it
-3. Default interpretation of "shelf stock" = "Shelf Stock ($)"
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-GENERAL SQL RULES
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1. ALWAYS wrap column names in double-quotes: "Shelf Stock ($)"
-2. Use = for exact matches, LIKE only for searches
-3. "Plant" is TEXT (use quotes): WHERE "Plant" = '2001'
-4. Default LIMIT is 10 unless user specifies
-5. NEVER run INSERT, UPDATE, DELETE, DROP, or ALTER
-6. ROUND all dollar values and percentages to 2 decimals
-7. For divisions, protect against divide-by-zero with CASE WHEN
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RESPONSE FORMAT
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Structure every response as:
-1. Brief acknowledgment
-2. SQL query in ```sql code block
-3. Results in a clean table
-4. 1-2 sentence summary
-
-Keep responses concise and professional.
+You are an expert SQL analyst working on inventory data.
 """
 
 
@@ -292,14 +131,10 @@ def initialize_agent():
     engine = create_engine(f"sqlite:///{DB_PATH}")
     db = SQLDatabase(engine=engine)
 
-    if "OPENAI_API_KEY" not in st.secrets:
-        st.error("⚠️ Please add OPENAI_API_KEY in Streamlit secrets.")
-        st.stop()
-
     api_key = st.secrets["OPENAI_API_KEY"]
 
     llm = ChatOpenAI(
-        model="gpt-4o",  # Changed to gpt-4o for better accuracy
+        model="gpt-4o",
         temperature=0,
         api_key=api_key,
     )
@@ -308,114 +143,467 @@ def initialize_agent():
     tools = toolkit.get_tools()
 
     agent = create_react_agent(llm, tools, prompt=build_system_prompt())
-    logger.info("Agent initialized successfully.")
     return agent, engine
-
-
-# ---------------- SCHEMA EXPANDER ----------------
-
-def show_schema_expander(engine):
-    with st.expander("🔍 View Database Schema & Sample Data", expanded=False):
-        try:
-            df_preview = pd.read_sql("SELECT * FROM inventory LIMIT 10", engine)
-            total = pd.read_sql("SELECT COUNT(*) AS cnt FROM inventory", engine)["cnt"][0]
-            
-            # Additional stats
-            stats = pd.read_sql("""
-                SELECT 
-                    COUNT(*) as total_rows,
-                    COUNT(DISTINCT "Material Name") as unique_materials,
-                    COUNT(CASE WHEN "SOP Family" IS NOT NULL THEN 1 END) as rows_with_sop_family,
-                    COUNT(CASE WHEN "Shelf Stock ($)" > 0 THEN 1 END) as rows_with_shelf_stock
-                FROM inventory
-            """, engine)
-            
-            st.write(f"**Total rows: {total:,}**")
-            st.write(f"**Unique materials: {stats['unique_materials'][0]:,}**")
-            st.write(f"**Rows with SOP Family: {stats['rows_with_sop_family'][0]:,}** ({(stats['rows_with_sop_family'][0] / total) * 100:.1f}%)")
-            st.write(f"**Rows with Shelf Stock ($) > 0: {stats['rows_with_shelf_stock'][0]:,}** ({(stats['rows_with_shelf_stock'][0] / total) * 100:.1f}%)")
-            st.write(f"**Columns ({len(df_preview.columns)}):** {', '.join(df_preview.columns[:8])}...")
-            st.dataframe(df_preview, use_container_width=True)
-        except Exception as e:
-            st.warning(f"Could not load schema preview: {e}")
 
 
 # ---------------- UI ----------------
 
 def main():
     st.title("📦 Inventory NLQ Chatbot")
-    st.markdown("Ask questions about your inventory data in plain English.")
-
-    with st.sidebar:
-        st.header("📊 Quick Questions")
-
-        example_questions = [
-            "Show top 10 materials by shelf stock value",
-            "What materials have the highest shelf stock?",
-            "Show shelf stock for SENSORS across all plants",
-            "Which SOP families have the most shelf stock value?",
-            "Show demand vs shelf stock for top 10 materials",
-            "List all raw materials with shelf stock > 0",
-            "What is the total shelf stock value by material type?",
-            "Show top materials by demand",
-            "How many unique materials are in the NUHEAT family?",
-            "What plants have FIBER products in stock?",
-        ]
-
-        for q in example_questions:
-            if st.button(q, key=q, use_container_width=True):
-                st.session_state.prefill_query = q
-                st.rerun()
-
-        st.markdown("---")
-        if st.button("🗑️ Clear Chat", use_container_width=True):
-            st.session_state.chat_history = []
-            st.session_state.prefill_query = None
-            st.rerun()
 
     agent, engine = initialize_agent()
 
-    show_schema_expander(engine)
-    st.markdown("---")
-
-    for msg in st.session_state.chat_history:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-
-    user_input = st.chat_input("Ask a question about your inventory...")
-
-    if st.session_state.prefill_query:
-        user_input = st.session_state.prefill_query
-        st.session_state.prefill_query = None
+    user_input = st.chat_input("Ask a question...")
 
     if user_input:
-        st.session_state.chat_history.append({"role": "user", "content": user_input})
+        with st.spinner("Thinking..."):
+            try:
+                result = agent.invoke(
+                    {"messages": [{"role": "user", "content": user_input}]}
+                )
 
-        with st.chat_message("user"):
-            st.markdown(user_input)
+                response = result["messages"][-1].content
 
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                try:
-                    result = agent.invoke(
-                        {"messages": [{"role": "user", "content": user_input}]}
-                    )
-                    response = result["messages"][-1].content
-                    st.markdown(response)
-                    st.session_state.chat_history.append(
-                        {"role": "assistant", "content": response}
-                    )
-                except Exception as e:
-                    error_msg = f"❌ Error: {str(e)}"
-                    logger.error(error_msg)
-                    st.error(error_msg)
-                    st.session_state.chat_history.append(
-                        {"role": "assistant", "content": error_msg}
-                    )
+                # Extract SQL
+                sql_match = re.search(r"```sql(.*?)```", response, re.DOTALL)
+
+                if sql_match:
+                    query = sql_match.group(1)
+
+                    # ✅ Show SQL
+                    st.markdown("### 🧠 Generated SQL")
+                    st.code(query, language="sql")
+
+                    # ✅ Validate SQL
+                    validate_sql(query)
+
+                st.markdown(response)
+
+            except Exception as e:
+                st.error(f"❌ {str(e)}")
 
 
 if __name__ == "__main__":
     main()
+
+# import os
+# import logging
+# import sys
+# import streamlit as st
+# import pandas as pd
+# from sqlalchemy import create_engine, text
+
+# from langchain_community.utilities import SQLDatabase
+# from langchain_community.agent_toolkits import SQLDatabaseToolkit
+# from langchain_openai import ChatOpenAI
+
+# import warnings
+# warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+# from langgraph.prebuilt import create_react_agent
+
+
+# # ---------------- CONFIG ----------------
+
+# logging.basicConfig(
+#     level=logging.INFO,
+#     format="%(asctime)s - [%(levelname)s] - %(message)s",
+#     handlers=[
+#         logging.FileHandler("app_log.txt", encoding="utf-8"),
+#         logging.StreamHandler(sys.stderr),
+#     ],
+# )
+# logger = logging.getLogger(__name__)
+
+# BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# DB_PATH = os.path.join(BASE_DIR, "inventory.db")
+# EXCEL_PATH = os.path.join(BASE_DIR, "Current Inventory.xlsx")
+
+# st.set_page_config(
+#     page_title="Inventory NLQ Chatbot",
+#     page_icon="📦",
+#     layout="wide",
+# )
+
+# if "chat_history" not in st.session_state:
+#     st.session_state.chat_history = []
+# if "prefill_query" not in st.session_state:
+#     st.session_state.prefill_query = None
+
+
+# # ---------------- LOAD DATA ----------------
+
+# def load_excel_to_sqlite():
+#     """Load Excel into SQLite with proper data cleaning."""
+#     if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > 0:
+#         logger.info("SQLite DB already exists, skipping load.")
+#         return
+
+#     if not os.path.exists(EXCEL_PATH):
+#         st.error(f"❌ Excel file not found at: {EXCEL_PATH}")
+#         st.stop()
+
+#     logger.info(f"Loading Excel from {EXCEL_PATH}")
+#     df = pd.read_excel(EXCEL_PATH, engine="openpyxl")
+
+#     # Strip trailing spaces from column names (CRITICAL FIX)
+#     df.columns = [col.strip() for col in df.columns]
+#     logger.info(f"Column names after strip: {list(df.columns)}")
+
+#     # ===== DATA CLEANING =====
+    
+#     # 1. Replace empty strings with NULL for critical text columns
+#     critical_cols = [
+#         "Material Name", "SOP Family", "Product Family", 
+#         "Material Type", "Product Group", "Material Application",
+#         "Sub Application"
+#     ]
+#     for col in critical_cols:
+#         if col in df.columns:
+#             df[col] = df[col].replace('', None)
+#             df[col] = df[col].replace(' ', None)
+    
+#     # 2. Fill numeric NULLs with 0 for calculation columns
+#     numeric_cols = [
+#         "Shelf Stock", "Shelf Stock ($)", "GIT", "GIT ($)", 
+#         "WIP", "WIP($)", "DOH", "Safety Stock", "Demand"
+#     ]
+#     for col in numeric_cols:
+#         if col in df.columns:
+#             df[col] = df[col].fillna(0)
+    
+#     # 3. Remove rows with NULL Material Name (these are junk rows)
+#     before_count = len(df)
+#     df = df[df["Material Name"].notna()]
+#     after_count = len(df)
+#     logger.info(f"Removed {before_count - after_count} rows with NULL Material Name")
+    
+#     # 4. Log cleaning statistics
+#     logger.info(f"Data cleaned: {len(df):,} valid rows retained")
+#     logger.info(f"Rows with SOP Family: {df['SOP Family'].notna().sum():,} ({(df['SOP Family'].notna().sum() / len(df)) * 100:.1f}%)")
+#     logger.info(f"Rows with Shelf Stock > 0: {(df['Shelf Stock'] > 0).sum():,}")
+#     logger.info(f"Rows with Shelf Stock ($) > 0: {(df['Shelf Stock ($)'] > 0).sum():,}")
+    
+#     # ===== END CLEANING =====
+
+#     engine = create_engine(f"sqlite:///{DB_PATH}")
+#     df.to_sql("inventory", engine, if_exists="replace", index=False)
+    
+#     # Create indexes for better query performance
+#     with engine.connect() as conn:
+#         conn.execute(text('CREATE INDEX IF NOT EXISTS idx_material_name ON inventory("Material Name")'))
+#         conn.execute(text('CREATE INDEX IF NOT EXISTS idx_sop_family ON inventory("SOP Family")'))
+#         conn.execute(text('CREATE INDEX IF NOT EXISTS idx_plant ON inventory("Plant")'))
+#         conn.execute(text('CREATE INDEX IF NOT EXISTS idx_shelf_stock ON inventory("Shelf Stock ($)")'))
+#         conn.commit()
+    
+#     engine.dispose()
+#     logger.info(f"Data written to {DB_PATH} — {len(df):,} rows, {len(df.columns)} columns")
+
+
+# # ---------------- SYSTEM PROMPT ----------------
+
+# def build_system_prompt() -> str:
+#     return """You are a helpful inventory data analyst. You answer questions by writing and running SQL
+# against a SQLite database. Think carefully before writing SQL — follow every rule below.
+
+# ════════════════════════════════════════════════════════
+# DATABASE:  SQLite   TABLE: inventory   ROWS: ~126,000
+# ════════════════════════════════════════════════════════
+
+# ⚠️  CRITICAL RULES - READ THESE FIRST ⚠️
+# 1. ALWAYS use "Material Name" column (descriptive names), NEVER "Material" (codes)
+#    - Exception: Only show "Material" if user explicitly asks for "material codes" or "material IDs"
+
+# 2. When asked "top materials" WITHOUT explicit sorting criteria:
+#    → ALWAYS sort by "Shelf Stock ($)" DESC (highest shelf stock value first)
+#    - Only sort by "Demand" if user explicitly says "by demand" or "highest demand"
+
+# 3. For aggregations across multiple materials/plants:
+#    → ALWAYS use "Shelf Stock ($)" for dollar values
+#    → NEVER sum "Shelf Stock" (raw quantities) across different UOMs
+
+# 4. ALWAYS add NULL filters for these columns when using them:
+#    - "Material Name" IS NOT NULL (on EVERY query showing materials)
+#    - "SOP Family" IS NOT NULL (when filtering/grouping by SOP Family)
+#    - "Product Family" IS NOT NULL (when filtering/grouping by Product Family)
+#    - "Product Group" IS NOT NULL (when filtering/grouping by Product Group)
+
+# 5. When filtering by product type (SENSORS, FIBER, NUHEAT, etc.):
+#    → Use "SOP Family" column with exact match (=)
+#    → NEVER use "MRP Controller Text" (contains planner names, not product types)
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# COLUMN REFERENCE  (wrap EVERY column name in double-quotes in SQL)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Column Name            | Type    | What it means
+# -----------------------|---------|-----------------------------
+# "Plant"                | TEXT    | Plant/site ID e.g. 2001, 2024
+# "Material"             | TEXT    | Material code e.g. 363097-000 (DO NOT USE - use "Material Name")
+# "Material Name"        | TEXT    | Full name of the material (ALWAYS USE THIS)
+# "Material Type"        | TEXT    | Category of material
+# "UOM"                  | TEXT    | Unit of measure e.g. FT, EA, KG
+# "Shelf Stock"          | REAL    | Quantity on shelf (in UOM units) - DO NOT SUM across materials
+# "Shelf Stock ($)"      | REAL    | Dollar value of shelf stock - SAFE TO SUM
+# "GIT"                  | REAL    | Goods in transit quantity
+# "GIT ($)"              | REAL    | Dollar value of GIT
+# "WIP"                  | REAL    | Work in progress quantity
+# "WIP($)"               | REAL    | Dollar value of WIP
+# "DOH"                  | REAL    | Days on hand
+# "Safety Stock"         | REAL    | Minimum stock to keep
+# "Demand"               | REAL    | Total demand quantity
+# "Product Family"       | TEXT    | Product family code e.g. ETL, HWAT
+# "SOP Family"           | TEXT    | SOP planning family — PRIMARY product classification
+# "Product Group"        | TEXT    | Detailed product group name
+# "Material Group"       | TEXT    | Material group e.g. Custom Cable
+# "Product Category"     | TEXT    | Category e.g. PD / Project
+# "Material Application" | TEXT    | Application e.g. KA / Floor Heating
+# "Sub Application"      | TEXT    | Sub-application e.g. KSA / Leak Detection
+# "ABC"                  | TEXT    | ABC classification: A, B, or C
+# "MRP Controller Text"  | TEXT    | MRP controller/planner name — NOT a product category
+# "Purchasing Group Text"| TEXT    | Purchasing group name
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# KNOWN COLUMN VALUES (use exact match = for known values)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# "Material Type" — 11 exact values:
+#   Raw materials | Semifinished products | Finished products | Trading goods
+#   Packaging | Operating supplies-NON VA | Nonvaluated materials
+#   Prod. resources/tools | Optng suppl/Non Cos-VALUA | Spare parts | Services
+
+# "ABC":  A | B | C
+
+# "SOP Family" — 21 exact values (use = not LIKE):
+#   SENSORS | MONO | NUHEAT | RWC-BO | FIBER | FIBER-COAT | FIBER-ZONE
+#   SEN-BULK | SEN-KITT | SENSORS ROPED CABLES | SENSORS SUB ASSY
+#   SENSORS SUB EPOXY | Reynosa Sensors | Reynosa FrostGuards | Reynosa Panel Shop
+#   MONO-CEL_D | CMPT | PKG | nVent Thermal Europe | (and 2 others)
+
+#   ⚠️  'SENSORS' means ONLY 'SENSORS' - does NOT include SEN-BULK, SEN-KITT, etc.
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CRITICAL QUERY PATTERNS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# 1. TOP MATERIALS (without explicit sort criteria):
+#    ✅ CORRECT - Sort by Shelf Stock ($):
+#    SELECT "Material Name",
+#           ROUND(SUM("Shelf Stock ($)"), 2) AS "Shelf Stock Value ($)",
+#           ROUND(SUM("Demand"), 2) AS "Total Demand"
+#    FROM inventory
+#    WHERE "Material Name" IS NOT NULL
+#    GROUP BY "Material Name"
+#    ORDER BY SUM("Shelf Stock ($)") DESC
+#    LIMIT 10;
+
+# 2. SENSOR SHELF STOCK BY PLANT:
+#    ✅ CORRECT:
+#    SELECT "Plant",
+#           COUNT("Material") AS item_count,
+#           ROUND(SUM("Shelf Stock"), 2) AS total_shelf_stock_units,
+#           ROUND(SUM("Shelf Stock ($)"), 2) AS total_shelf_stock_value
+#    FROM inventory
+#    WHERE "SOP Family" = 'SENSORS'
+#      AND "Shelf Stock" > 0
+#      AND "SOP Family" IS NOT NULL
+#    GROUP BY "Plant"
+#    ORDER BY total_shelf_stock_units DESC;
+
+# 3. MATERIALS BY SOP FAMILY:
+#    ✅ CORRECT - Always add IS NOT NULL:
+#    SELECT "SOP Family",
+#           COUNT(DISTINCT "Material Name") AS material_count,
+#           ROUND(SUM("Shelf Stock ($)"), 2) AS total_value
+#    FROM inventory
+#    WHERE "SOP Family" IS NOT NULL
+#      AND "Material Name" IS NOT NULL
+#    GROUP BY "SOP Family"
+#    ORDER BY total_value DESC
+#    LIMIT 10;
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# NULL HANDLING - MANDATORY FILTERS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ⚠️  90% of rows have NULL SOP Family - this is NORMAL for this dataset.
+# ⚠️  Always add IS NOT NULL when filtering/grouping these columns:
+
+# - "Material Name" IS NOT NULL → Add to ALL material queries
+# - "SOP Family" IS NOT NULL → Add when using SOP Family
+# - "Product Family" IS NOT NULL → Add when using Product Family
+# - "Product Group" IS NOT NULL → Add when using Product Group
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# SHELF STOCK - QUANTITY vs VALUE (CRITICAL)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# "Shelf Stock" = RAW QUANTITY (FT, EA, LB, etc.) - different UOMs per row
+# "Shelf Stock ($)" = DOLLAR VALUE - safe to SUM across all materials
+
+# RULES:
+# 1. For aggregations across multiple materials → ALWAYS use "Shelf Stock ($)"
+# 2. Only use "Shelf Stock" when:
+#    - Filtering a single material with known UOM
+#    - User explicitly asks for "quantity" or "units"
+#    - You show "UOM" column alongside it
+# 3. Default interpretation of "shelf stock" = "Shelf Stock ($)"
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# GENERAL SQL RULES
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 1. ALWAYS wrap column names in double-quotes: "Shelf Stock ($)"
+# 2. Use = for exact matches, LIKE only for searches
+# 3. "Plant" is TEXT (use quotes): WHERE "Plant" = '2001'
+# 4. Default LIMIT is 10 unless user specifies
+# 5. NEVER run INSERT, UPDATE, DELETE, DROP, or ALTER
+# 6. ROUND all dollar values and percentages to 2 decimals
+# 7. For divisions, protect against divide-by-zero with CASE WHEN
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# RESPONSE FORMAT
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Structure every response as:
+# 1. Brief acknowledgment
+# 2. SQL query in ```sql code block
+# 3. Results in a clean table
+# 4. 1-2 sentence summary
+
+# Keep responses concise and professional.
+# """
+
+
+# # ---------------- AGENT ----------------
+
+# @st.cache_resource
+# def initialize_agent():
+#     load_excel_to_sqlite()
+
+#     engine = create_engine(f"sqlite:///{DB_PATH}")
+#     db = SQLDatabase(engine=engine)
+
+#     if "OPENAI_API_KEY" not in st.secrets:
+#         st.error("⚠️ Please add OPENAI_API_KEY in Streamlit secrets.")
+#         st.stop()
+
+#     api_key = st.secrets["OPENAI_API_KEY"]
+
+#     llm = ChatOpenAI(
+#         model="gpt-4o",  # Changed to gpt-4o for better accuracy
+#         temperature=0,
+#         api_key=api_key,
+#     )
+
+#     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+#     tools = toolkit.get_tools()
+
+#     agent = create_react_agent(llm, tools, prompt=build_system_prompt())
+#     logger.info("Agent initialized successfully.")
+#     return agent, engine
+
+
+# # ---------------- SCHEMA EXPANDER ----------------
+
+# def show_schema_expander(engine):
+#     with st.expander("🔍 View Database Schema & Sample Data", expanded=False):
+#         try:
+#             df_preview = pd.read_sql("SELECT * FROM inventory LIMIT 10", engine)
+#             total = pd.read_sql("SELECT COUNT(*) AS cnt FROM inventory", engine)["cnt"][0]
+            
+#             # Additional stats
+#             stats = pd.read_sql("""
+#                 SELECT 
+#                     COUNT(*) as total_rows,
+#                     COUNT(DISTINCT "Material Name") as unique_materials,
+#                     COUNT(CASE WHEN "SOP Family" IS NOT NULL THEN 1 END) as rows_with_sop_family,
+#                     COUNT(CASE WHEN "Shelf Stock ($)" > 0 THEN 1 END) as rows_with_shelf_stock
+#                 FROM inventory
+#             """, engine)
+            
+#             st.write(f"**Total rows: {total:,}**")
+#             st.write(f"**Unique materials: {stats['unique_materials'][0]:,}**")
+#             st.write(f"**Rows with SOP Family: {stats['rows_with_sop_family'][0]:,}** ({(stats['rows_with_sop_family'][0] / total) * 100:.1f}%)")
+#             st.write(f"**Rows with Shelf Stock ($) > 0: {stats['rows_with_shelf_stock'][0]:,}** ({(stats['rows_with_shelf_stock'][0] / total) * 100:.1f}%)")
+#             st.write(f"**Columns ({len(df_preview.columns)}):** {', '.join(df_preview.columns[:8])}...")
+#             st.dataframe(df_preview, use_container_width=True)
+#         except Exception as e:
+#             st.warning(f"Could not load schema preview: {e}")
+
+
+# # ---------------- UI ----------------
+
+# def main():
+#     st.title("📦 Inventory NLQ Chatbot")
+#     st.markdown("Ask questions about your inventory data in plain English.")
+
+#     with st.sidebar:
+#         st.header("📊 Quick Questions")
+
+#         example_questions = [
+#             "Show top 10 materials by shelf stock value",
+#             "What materials have the highest shelf stock?",
+#             "Show shelf stock for SENSORS across all plants",
+#             "Which SOP families have the most shelf stock value?",
+#             "Show demand vs shelf stock for top 10 materials",
+#             "List all raw materials with shelf stock > 0",
+#             "What is the total shelf stock value by material type?",
+#             "Show top materials by demand",
+#             "How many unique materials are in the NUHEAT family?",
+#             "What plants have FIBER products in stock?",
+#         ]
+
+#         for q in example_questions:
+#             if st.button(q, key=q, use_container_width=True):
+#                 st.session_state.prefill_query = q
+#                 st.rerun()
+
+#         st.markdown("---")
+#         if st.button("🗑️ Clear Chat", use_container_width=True):
+#             st.session_state.chat_history = []
+#             st.session_state.prefill_query = None
+#             st.rerun()
+
+#     agent, engine = initialize_agent()
+
+#     show_schema_expander(engine)
+#     st.markdown("---")
+
+#     for msg in st.session_state.chat_history:
+#         with st.chat_message(msg["role"]):
+#             st.markdown(msg["content"])
+
+#     user_input = st.chat_input("Ask a question about your inventory...")
+
+#     if st.session_state.prefill_query:
+#         user_input = st.session_state.prefill_query
+#         st.session_state.prefill_query = None
+
+#     if user_input:
+#         st.session_state.chat_history.append({"role": "user", "content": user_input})
+
+#         with st.chat_message("user"):
+#             st.markdown(user_input)
+
+#         with st.chat_message("assistant"):
+#             with st.spinner("Thinking..."):
+#                 try:
+#                     result = agent.invoke(
+#                         {"messages": [{"role": "user", "content": user_input}]}
+#                     )
+#                     response = result["messages"][-1].content
+#                     st.markdown(response)
+#                     st.session_state.chat_history.append(
+#                         {"role": "assistant", "content": response}
+#                     )
+#                 except Exception as e:
+#                     error_msg = f"❌ Error: {str(e)}"
+#                     logger.error(error_msg)
+#                     st.error(error_msg)
+#                     st.session_state.chat_history.append(
+#                         {"role": "assistant", "content": error_msg}
+#                     )
+
+
+# if __name__ == "__main__":
+#     main()
 
 # import os
 # import logging
