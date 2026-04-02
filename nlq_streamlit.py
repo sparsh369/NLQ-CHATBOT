@@ -10,9 +10,6 @@ from langchain_community.utilities import SQLDatabase
 from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langchain_openai import ChatOpenAI
 
-import warnings
-warnings.filterwarnings("ignore", category=DeprecationWarning)
-
 from langgraph.prebuilt import create_react_agent
 
 # ---------------- CONFIG ----------------
@@ -31,34 +28,30 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "inventory.db")
 EXCEL_PATH = os.path.join(BASE_DIR, "Current Inventory.xlsx")
 
-st.set_page_config(
-    page_title="Inventory NLQ Chatbot",
-    page_icon="📦",
-    layout="wide",
-)
-
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-if "prefill_query" not in st.session_state:
-    st.session_state.prefill_query = None
-
+st.set_page_config(page_title="Inventory NLQ Chatbot", layout="wide")
 
 # ---------------- SQL VALIDATION ----------------
 
-def validate_sql(query: str):
+def validate_sql(query: str, user_question: str):
     q = query.upper()
+    uq = user_question.upper()
 
     if 'SUM("SHELF STOCK")' in q:
-        raise ValueError('❌ Invalid: Cannot SUM "Shelf Stock" (mixed UOM). Use "Shelf Stock ($)"')
+        raise ValueError('❌ Cannot SUM "Shelf Stock". Use "Shelf Stock ($)"')
 
     if 'SOP FAMILY' in q and 'LIKE' in q:
-        raise ValueError('❌ Invalid: Use "=" instead of LIKE for SOP Family')
+        raise ValueError('❌ Use "=" for SOP Family')
 
-    if '"SOP FAMILY"' in q and 'IS NOT NULL' not in q:
-        raise ValueError('❌ Missing: "SOP Family" IS NOT NULL')
+    if "SENSORS" in uq and '"SOP FAMILY" = \'SENSORS\'' not in q:
+        raise ValueError('❌ Missing filter: SOP Family = SENSORS')
 
     return True
 
+# ---------------- SANITY CHECK ----------------
+
+def sanity_check(response_text):
+    if any(x in response_text for x in ["e+", "E+"]):
+        raise ValueError("❌ Result too large → possible wrong aggregation")
 
 # ---------------- LOAD DATA ----------------
 
@@ -67,60 +60,43 @@ def load_excel_to_sqlite():
         return
 
     df = pd.read_excel(EXCEL_PATH, engine="openpyxl")
-
     df.columns = [col.strip() for col in df.columns]
-
-    critical_cols = [
-        "Material Name", "SOP Family", "Product Family",
-        "Material Type", "Product Group", "Material Application",
-        "Sub Application"
-    ]
-
-    for col in critical_cols:
-        if col in df.columns:
-            df[col] = df[col].replace('', None)
-            df[col] = df[col].replace(' ', None)
 
     numeric_cols = [
         "Shelf Stock", "Shelf Stock ($)", "GIT", "GIT ($)",
         "WIP", "WIP($)", "DOH", "Safety Stock", "Demand"
     ]
 
-    # ✅ FIX: Force numeric conversion
+    # FIX numeric types
     for col in numeric_cols:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
     df = df[df["Material Name"].notna()]
 
     engine = create_engine(f"sqlite:///{DB_PATH}")
     df.to_sql("inventory", engine, if_exists="replace", index=False)
-
-    with engine.connect() as conn:
-        conn.execute(text('CREATE INDEX IF NOT EXISTS idx_material_name ON inventory("Material Name")'))
-        conn.execute(text('CREATE INDEX IF NOT EXISTS idx_sop_family ON inventory("SOP Family")'))
-        conn.commit()
-
     engine.dispose()
 
+# ---------------- PROMPT ----------------
 
-# ---------------- SYSTEM PROMPT ----------------
-
-def build_system_prompt() -> str:
+def build_system_prompt():
     return """
-🚨 STRICT VALIDATION RULES (DO NOT BREAK):
+You are an expert SQL analyst.
 
-1. NEVER use SUM("Shelf Stock")
-2. ALWAYS use SUM("Shelf Stock ($)") for totals
-3. ALWAYS use "=" for SOP Family (NO LIKE)
-4. ALWAYS include "SOP Family" IS NOT NULL
-5. ALWAYS use COUNT(DISTINCT "Material Name")
+Follow STRICT steps:
+1. Understand question
+2. Identify filters (SOP Family, Plant, etc.)
+3. Use ONLY correct columns
+4. ALWAYS use "Shelf Stock ($)" for totals
+5. NEVER use SUM("Shelf Stock")
+6. ALWAYS use "=" for SOP Family
+7. ALWAYS include required filters
 
-If any rule is violated → rewrite query
-
-You are an expert SQL analyst working on inventory data.
+Before final answer:
+→ Recheck SQL
+→ Fix if incorrect
 """
-
 
 # ---------------- AGENT ----------------
 
@@ -131,56 +107,61 @@ def initialize_agent():
     engine = create_engine(f"sqlite:///{DB_PATH}")
     db = SQLDatabase(engine=engine)
 
-    api_key = st.secrets["OPENAI_API_KEY"]
-
     llm = ChatOpenAI(
         model="gpt-4o",
         temperature=0,
-        api_key=api_key,
+        api_key=st.secrets["OPENAI_API_KEY"],
     )
 
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
-    tools = toolkit.get_tools()
+    agent = create_react_agent(llm, toolkit.get_tools(), prompt=build_system_prompt())
 
-    agent = create_react_agent(llm, tools, prompt=build_system_prompt())
-    return agent, engine
+    return agent
 
-
-# ---------------- UI ----------------
+# ---------------- MAIN ----------------
 
 def main():
     st.title("📦 Inventory NLQ Chatbot")
 
-    agent, engine = initialize_agent()
+    agent = initialize_agent()
 
-    user_input = st.chat_input("Ask a question...")
+    user_input = st.chat_input("Ask your question...")
 
     if user_input:
-        with st.spinner("Thinking..."):
+        MAX_RETRIES = 2
+
+        for attempt in range(MAX_RETRIES):
             try:
-                result = agent.invoke(
-                    {"messages": [{"role": "user", "content": user_input}]}
-                )
+                with st.spinner(f"Thinking... (Attempt {attempt+1})"):
+                    result = agent.invoke(
+                        {"messages": [{"role": "user", "content": user_input}]}
+                    )
 
-                response = result["messages"][-1].content
+                    response = result["messages"][-1].content
 
-                # Extract SQL
-                sql_match = re.search(r"```sql(.*?)```", response, re.DOTALL)
+                    # Extract SQL
+                    sql_match = re.search(r"```sql(.*?)```", response, re.DOTALL)
 
-                if sql_match:
-                    query = sql_match.group(1)
+                    if sql_match:
+                        query = sql_match.group(1)
 
-                    # ✅ Show SQL
-                    st.markdown("### 🧠 Generated SQL")
-                    st.code(query, language="sql")
+                        st.markdown("### 🧠 Generated SQL")
+                        st.code(query, language="sql")
 
-                    # ✅ Validate SQL
-                    validate_sql(query)
+                        # Validate SQL
+                        validate_sql(query, user_input)
 
-                st.markdown(response)
+                    # Sanity check
+                    sanity_check(response)
+
+                    st.markdown(response)
+                    break
 
             except Exception as e:
-                st.error(f"❌ {str(e)}")
+                if attempt < MAX_RETRIES - 1:
+                    st.warning(f"⚠️ Fixing query... retry {attempt+1}")
+                else:
+                    st.error(f"❌ Failed: {str(e)}")
 
 
 if __name__ == "__main__":
